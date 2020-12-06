@@ -21,10 +21,11 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/pflag"
-	"k8s.io/code-generator/cmd/informer-gen/generators"
-	"k8s.io/code-generator/pkg/util"
 	"k8s.io/gengo/args"
 	"k8s.io/klog/v2"
+
+	"k8s.io/code-generator/cmd/informer-gen/generators"
+	"k8s.io/code-generator/pkg/util"
 
 	generatorargs "k8s.io/code-generator/cmd/informer-gen/args"
 )
@@ -42,10 +43,17 @@ func main() {
 	customArgs.ListersPackage = "k8s.io/kubernetes/pkg/client/listers"
 
 	genericArgs.AddFlags(pflag.CommandLine)
-	customArgs.AddFlags(pflag.CommandLine)
+	customArgs.AddFlags(pflag.CommandLine, "k8s.io/kubernetes/pkg/apis") // TODO: move this input path out of informer-gen
 	flag.Set("logtostderr", "true")
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
+
+	// add group version package as input dirs for gengo
+	for _, pkg := range customArgs.Groups {
+		for _, v := range pkg.Versions {
+			genericArgs.InputDirs = append(genericArgs.InputDirs, v.Package)
+		}
+	}
 
 	if err := generatorargs.Validate(genericArgs); err != nil {
 		klog.Fatalf("Error: %v", err)

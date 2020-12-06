@@ -18,7 +18,6 @@ package generators
 
 import (
 	"fmt"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -31,6 +30,7 @@ import (
 	"k8s.io/code-generator/cmd/client-gen/generators/util"
 	clientgentypes "k8s.io/code-generator/cmd/client-gen/types"
 	informergenargs "k8s.io/code-generator/cmd/informer-gen/args"
+	"k8s.io/code-generator/cmd/informer-gen/path"
 	genutil "k8s.io/code-generator/pkg/util"
 )
 
@@ -89,11 +89,46 @@ func packageForInternalInterfaces(base string) string {
 	return filepath.Join(base, "internalinterfaces")
 }
 
-func vendorless(p string) string {
-	if pos := strings.LastIndex(p, "/vendor/"); pos != -1 {
-		return p[pos+len("/vendor/"):]
+// applyGroupOverrides applies group name overrides to each package, if applicable. If there is a
+// comment of the form "// +groupName=somegroup" or "// +groupName=somegroup.foo.bar.io", use the
+// first field (somegroup) as the name of the group in Go code, e.g. as the func name in a clientset.
+//
+// If the first field of the groupName is not unique within the clientset, use "// +groupName=unique
+func applyGroupOverrides(universe types.Universe, customArgs *informergenargs.CustomArgs) {
+	// Create a map from "old GV" to "new GV" so we know what changes we need to make.
+	changes := make(map[clientgentypes.GroupVersion]clientgentypes.GroupVersion)
+	for gv, inputDir := range customArgs.GroupVersionPackages() {
+		p := universe.Package(path.Vendorless(inputDir))
+		if override := types.ExtractCommentTags("+", p.Comments)["groupName"]; override != nil {
+			newGV := clientgentypes.GroupVersion{
+				Group:   clientgentypes.Group(override[0]),
+				Version: gv.Version,
+			}
+			changes[gv] = newGV
+		}
 	}
-	return p
+
+	// Modify customArgs.Groups based on the groupName overrides.
+	newGroups := make([]clientgentypes.GroupVersions, 0, len(customArgs.Groups))
+	for _, gvs := range customArgs.Groups {
+		gv := clientgentypes.GroupVersion{
+			Group:   gvs.Group,
+			Version: gvs.Versions[0].Version, // we only need a version, and the first will do
+		}
+		if newGV, ok := changes[gv]; ok {
+			// There's an override, so use it.
+			newGVS := clientgentypes.GroupVersions{
+				PackageName: gvs.PackageName,
+				Group:       newGV.Group,
+				Versions:    gvs.Versions,
+			}
+			newGroups = append(newGroups, newGVS)
+		} else {
+			// No override.
+			newGroups = append(newGroups, gvs)
+		}
+	}
+	customArgs.Groups = newGroups
 }
 
 // Packages makes the client package definition.
@@ -107,6 +142,9 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 	if !ok {
 		klog.Fatalf("Wrong CustomArgs type: %T", arguments.CustomArgs)
 	}
+	includedTypesOverrides := customArgs.IncludedTypesOverrides
+
+	applyGroupOverrides(context.Universe, customArgs)
 
 	internalVersionPackagePath := filepath.Join(arguments.OutputPackagePath)
 	externalVersionPackagePath := filepath.Join(arguments.OutputPackagePath)
@@ -121,8 +159,8 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 	externalGroupVersions := make(map[string]clientgentypes.GroupVersions)
 	internalGroupVersions := make(map[string]clientgentypes.GroupVersions)
 	groupGoNames := make(map[string]string)
-	for _, inputDir := range arguments.InputDirs {
-		p := context.Universe.Package(vendorless(inputDir))
+	for gv, inputDir := range customArgs.GroupVersionPackages() {
+		p := context.Universe.Package(path.Vendorless(inputDir))
 
 		objectMeta, internal, err := objectMetaForPackage(p)
 		if err != nil {
@@ -133,9 +171,7 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 			continue
 		}
 
-		var gv clientgentypes.GroupVersion
 		var targetGroupVersions map[string]clientgentypes.GroupVersions
-
 		if internal {
 			lastSlash := strings.LastIndex(p.Path, "/")
 			if lastSlash == -1 {
@@ -144,17 +180,13 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 			gv.Group = clientgentypes.Group(p.Path[lastSlash+1:])
 			targetGroupVersions = internalGroupVersions
 		} else {
-			parts := strings.Split(p.Path, "/")
-			gv.Group = clientgentypes.Group(parts[len(parts)-2])
-			gv.Version = clientgentypes.Version(parts[len(parts)-1])
 			targetGroupVersions = externalGroupVersions
 		}
 		groupPackageName := gv.Group.NonEmpty()
-		gvPackage := path.Clean(p.Path)
+		gvPackage := filepath.Clean(p.Path)
 
 		// If there's a comment of the form "// +groupName=somegroup" or
-		// "// +groupName=somegroup.foo.bar.io", use the first field (somegroup) as the name of the
-		// group when generating.
+		// "// +groupName=somegroup.foo.bar.io", use it.
 		if override := types.ExtractCommentTags("+", p.Comments)["groupName"]; override != nil {
 			gv.Group = clientgentypes.Group(override[0])
 		}
@@ -167,15 +199,28 @@ func Packages(context *generator.Context, arguments *args.GeneratorArgs) generat
 		}
 
 		var typesToGenerate []*types.Type
-		for _, t := range p.Types {
+		for n, t := range p.Types {
+			// filter out types which are not included in user specified overrides.
+			typesOverride, ok := includedTypesOverrides[gv]
+			if ok {
+				var found bool
+				for _, typeStr := range typesOverride {
+					if typeStr == n {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+
 			tags := util.MustParseClientGenTags(append(t.SecondClosestCommentLines, t.CommentLines...))
 			if !tags.GenerateClient || tags.NoVerbs || !tags.HasVerb("list") || !tags.HasVerb("watch") {
 				continue
 			}
-
 			typesToGenerate = append(typesToGenerate, t)
-
-			if _, ok := typesForGroupVersion[gv]; !ok {
+			if _, found := typesForGroupVersion[gv]; !found {
 				typesForGroupVersion[gv] = []*types.Type{}
 			}
 			typesForGroupVersion[gv] = append(typesForGroupVersion[gv], t)
